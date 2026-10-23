@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { bitsoRequest } from '@/lib/bitso/client'
 import { resolveEtherfuseRampContext } from '@/lib/seyf/etherfuse-ramp-context'
 import { fetchDashboardCetesSaldo } from '@/lib/seyf/dashboard-cetes-saldo'
+import { priceInMxn as reflectorPriceInMxn } from '@/lib/stellar/reflector'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -35,7 +36,7 @@ async function bitsoMxnPrice(code: string): Promise<number | null> {
  * Devuelve el precio real en MXN por unidad de cada activo:
  *  - MXN/MXNB → 1
  *  - CETES → quote offramp real de Etherfuse (CETES→MXN)
- *  - resto → ticker público de Bitso (`<code>_mxn`)
+ *  - resto → Reflector (oráculo on-chain) y, si no cubre el activo, Bitso
  * Precios ausentes (sin book/quote) se omiten del mapa.
  */
 export async function GET(req: Request) {
@@ -48,6 +49,7 @@ export async function GET(req: Request) {
     const wallet = url.searchParams.get('wallet') ?? undefined
 
     const prices: Record<string, number> = {}
+    const sources: Record<string, 'reflector' | 'bitso' | 'etherfuse'> = {}
 
     await Promise.all(
       codes.map(async (code) => {
@@ -56,8 +58,21 @@ export async function GET(req: Request) {
           return
         }
         if (code === 'CETES') return // se resuelve abajo con Etherfuse
+
+        // Oráculo on-chain primero: el saldo que ve el usuario deja de depender
+        // de que un exchange privado responda.
+        const onchain = await reflectorPriceInMxn(code).catch(() => null)
+        if (onchain != null) {
+          prices[code] = onchain
+          sources[code] = 'reflector'
+          return
+        }
+
         const p = await bitsoMxnPrice(code)
-        if (p != null) prices[code] = p
+        if (p != null) {
+          prices[code] = p
+          sources[code] = 'bitso'
+        }
       }),
     )
 
@@ -66,13 +81,19 @@ export async function GET(req: Request) {
       try {
         const ctx = await resolveEtherfuseRampContext({ walletPublicKeyHint: wallet })
         const saldo = await fetchDashboardCetesSaldo(ctx)
-        if (saldo.kind === 'ok') prices['CETES'] = saldo.mxnPerCetes
+        if (saldo.kind === 'ok') {
+          prices['CETES'] = saldo.mxnPerCetes
+          sources['CETES'] = 'etherfuse'
+        }
       } catch {
         // sin precio CETES → se omite
       }
     }
 
-    return NextResponse.json({ prices, at: Date.now() }, { headers: { 'Cache-Control': 'no-store' } })
+    return NextResponse.json(
+      { prices, sources, at: Date.now() },
+      { headers: { 'Cache-Control': 'no-store' } },
+    )
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : 'error' }, { status: 502 })
   }

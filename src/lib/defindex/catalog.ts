@@ -1,6 +1,8 @@
 // Catálogo DeFindex testnet (Palta Labs). Fuente: testnet.contracts.json
 // https://github.com/paltalabs/defindex/blob/main/public/testnet.contracts.json
 
+import { isPublicStellarTestnet } from '@/lib/seyf/stellar-wallet-network'
+
 export const DEFINDEX_FACTORY_ADDRESS =
   'CDSCWE4GLNBYYTES2OCYDFQA2LLY4RBIAX6ZI32VSUXD7GO6HRPO4A32'
 
@@ -30,22 +32,22 @@ export interface DefindexStrategyConfig {
   apyTarget: number
 }
 
-// Direcciones de vault DeFindex (testnet), una por bóveda SEYF (CETES, USDC, XLM).
+// Direcciones de vault DeFindex, una por bóveda SEYF (CETES, USDC, XLM).
 // IMPORTANTE: deben ser VAULTS, no estrategias. La API DeFindex (GET /vault/{addr},
 // POST /vault/{addr}/deposit) rechaza direcciones de estrategia (→ 500/502).
-// Cada estrategia Blend (strategyAddress) va envuelta en su vault.
-// Configurables por env (NEXT_PUBLIC_DEFINDEX_VAULT_*) → pon ahí TUS vaults cuando los
-// crees en app.defindex.io. El fallback son los vaults de paltalabs que envuelven estas
-// mismas estrategias (funcionan, para no romper prod mientras tanto).
+// Configurables por env (NEXT_PUBLIC_DEFINDEX_VAULT_*) → pon ahí TUS vaults de mainnet.
+// El fallback a los vaults de paltalabs es SOLO testnet: en mainnet sin env el address
+// queda vacío a propósito (fallar visible es mejor que apuntar a contratos de testnet).
+const TESTNET_VAULT_FALLBACK = isPublicStellarTestnet()
 const VAULT_XLM =
   process.env.NEXT_PUBLIC_DEFINDEX_VAULT_XLM?.trim() ||
-  'CCLV4H7WTLJQ7ATLHBBQV2WW3OINF3FOY5XZ7VPHZO7NH3D2ZS4GFSF6'
+  (TESTNET_VAULT_FALLBACK ? 'CCLV4H7WTLJQ7ATLHBBQV2WW3OINF3FOY5XZ7VPHZO7NH3D2ZS4GFSF6' : '')
 const VAULT_CETES =
   process.env.NEXT_PUBLIC_DEFINDEX_VAULT_CETES?.trim() ||
-  'CBIS5TEMTNNOTBE3WXPQUAGUEDYZZVIWAKTXEQCOUJ34OJJ3FJ5NLF2P'
+  (TESTNET_VAULT_FALLBACK ? 'CBIS5TEMTNNOTBE3WXPQUAGUEDYZZVIWAKTXEQCOUJ34OJJ3FJ5NLF2P' : '')
 const VAULT_USDC =
   process.env.NEXT_PUBLIC_DEFINDEX_VAULT_USDC?.trim() ||
-  'CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN'
+  (TESTNET_VAULT_FALLBACK ? 'CBMVK2JK6NTOT2O4HNQAIQFJY232BHKGLIMXDVQVHIIZKDACXDFZDWHN' : '')
 
 // XLM va primero: el usuario tiene XLM (fondeado por Friendbot), así que es la
 // bóveda con la que sí puede depositar de inmediato → preferencia en UI y default.

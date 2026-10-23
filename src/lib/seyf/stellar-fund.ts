@@ -8,7 +8,9 @@ import { Horizon, NotFoundError } from '@stellar/stellar-sdk'
  * (trustline, depósito/retiro a bóvedas DeFindex). Friendbot crea la cuenta con
  * 10,000 XLM — el monto estándar de la red de pruebas de Stellar.
  *
- * En mainnet Friendbot no existe: el fondeo es responsabilidad del usuario/negocio.
+ * En mainnet Friendbot no existe. En vez de dejar al usuario sin salida, se le
+ * indica al cliente que pida la creación patrocinada (`needsSponsorship`):
+ * el negocio paga la reserva base vía /api/stellar/sponsor/create-account.
  */
 
 type StellarNetwork = 'testnet' | 'mainnet'
@@ -72,6 +74,8 @@ export type FundResult = {
   alreadyFunded: boolean
   /** Saldo XLM tras la operación (best-effort). */
   xlm: number | null
+  /** Mainnet sin cuenta en el ledger: hay que crearla con reserva patrocinada. */
+  needsSponsorship?: boolean
   message: string
 }
 
@@ -154,12 +158,17 @@ export async function ensureFunded(publicKey: string): Promise<FundResult> {
   }
 
   if (network === 'mainnet' || !friendbotUrl) {
+    // `current === null` = la cuenta no existe en el ledger todavía.
+    const needsSponsorship = current == null
     return {
       network,
       funded: false,
       alreadyFunded: false,
       xlm: current,
-      message: 'Friendbot no está disponible en mainnet; la wallet debe fondearse con XLM real.',
+      needsSponsorship,
+      message: needsSponsorship
+        ? 'La cuenta aún no existe en mainnet: créala con reserva patrocinada.'
+        : 'La wallet ya existe en mainnet; las fees se cubren por fee-bump.',
     }
   }
 
