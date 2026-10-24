@@ -1,0 +1,54 @@
+# SEYF — Stellar Info File (SEP-1)
+# Se sirve en https://<dominio>/.well-known/stellar.toml (CORS abierto, ver next.config.ts).
+# Guía: https://developers.stellar.org/docs/tokens/publishing-asset-info
+# WS2 · paso 1. Rellenar los valores marcados REEMPLAZAR antes de publicar en mainnet.
+
+VERSION="2.0.0"
+
+# Red pública (mainnet). En testnet usar: "Test SDF Network ; September 2015"
+NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
+
+# Llave PÚBLICA del servidor SEP-10 (derivada de SEP10_SERVER_SECRET; no es secreta).
+SIGNING_KEY="REEMPLAZAR_G_PUBLICA_DEL_SERVIDOR_SEP10"
+
+# SEP-10 Web Auth — ya implementado en el repo (src/app/api/auth/sep10).
+WEB_AUTH_ENDPOINT="https://REEMPLAZAR.dominio/api/auth/sep10"
+
+# Pendientes de WS2 (Anchor Platform). Descomentar cuando estén en vivo:
+# TRANSFER_SERVER_SEP0024="https://REEMPLAZAR.dominio/sep24"   # SEP-24
+# KYC_SERVER="https://REEMPLAZAR.dominio/sep12"                # SEP-12
+# ANCHOR_QUOTE_SERVER="https://REEMPLAZAR.dominio/sep38"       # SEP-38
+
+[DOCUMENTATION]
+ORG_NAME="SEYF"
+ORG_DBA="Seyfert Labs"
+ORG_URL="https://REEMPLAZAR.dominio"
+ORG_DESCRIPTION="Neobank full Stellar para México: bóvedas CETES on-chain, FX con Soroswap y Reflector, y rampas SPEI."
+ORG_OFFICIAL_EMAIL="REEMPLAZAR@dominio"
+ORG_SUPPORT_EMAIL="REEMPLAZAR@dominio"
+
+[[PRINCIPALS]]
+name="REEMPLAZAR — responsable del proyecto"
+email="REEMPLAZAR@dominio"
+
+# Activos que SEYF usa/ancla. El issuer de USDC en mainnet es el de Circle
+# (la misma dirección que va en STELLAR_USDC_ISSUER).
+[[CURRENCIES]]
+code="USDC"
+issuer="REEMPLAZAR_G_ISSUER_USDC_MAINNET"
+is_asset_anchored=true
+anchor_asset_type="fiat"
+status="live"
+display_decimals=7
+name="USD Coin"
+desc="USDC emitido por Circle."
+
+# Ejemplo para cuando se publiquen CETES/MEXe de Etherfuse en mainnet:
+# [[CURRENCIES]]
+# code="MXNe"
+# issuer="REEMPLAZAR_G_ISSUER_MXNE"
+# is_asset_anchored=true
+# anchor_asset_type="fiat"
+# status="live"
+# display_decimals=7
+# name="MXN estable (Etherfuse)"

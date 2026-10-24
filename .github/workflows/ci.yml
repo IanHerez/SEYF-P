@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dynerox]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      # Gate real: Next 16 no corre ESLint en el build, así que `build` valida
+      # tipos + compilación. Hoy pasa en verde.
+      - name: Build (typecheck + compile)
+        run: npm run build
+        env:
+          # El build corre contra testnet con placeholders públicos; los secretos
+          # reales viven en Vercel, nunca en CI.
+          NEXT_PUBLIC_STELLAR_NETWORK: testnet
+          NEXT_TELEMETRY_DISABLED: '1'
+
+      # Informativo mientras se salda la deuda de lint (~1955 errores heredados,
+      # React 19 / react-hooks). No bloquea el pipeline todavía: quitar
+      # `continue-on-error` cuando `npm run lint` quede en verde.
+      - name: Lint (informational)
+        run: npm run lint
+        continue-on-error: true

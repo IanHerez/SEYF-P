@@ -652,3 +652,4 @@ export async function addMonthlyUsage(
     { onConflict: "wallet_address,period" },
   );
 }
+

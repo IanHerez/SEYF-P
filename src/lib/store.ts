@@ -4,6 +4,8 @@
 // usa los route handlers /api/db/* (Supabase, persistente); si no, cae a
 // localStorage (modo demo, no se conserva al limpiar cookies).
 
+import { awaitSeyfAuthAccount, seyfAuthHeaders } from "@/lib/stellar/auth-token";
+
 const USE_DB = process.env.NEXT_PUBLIC_USE_SUPABASE === "true";
 
 export interface StoreVault {
@@ -71,15 +73,41 @@ const LS = {
   },
 };
 
+// Las rutas /api/db/* exigen sesión SEP-10: el token va en cada llamada y la
+// wallet se reescribe con la cuenta Stellar que firmó. Así la clave de los
+// datos es siempre la identidad probada, no la dirección que pase la pantalla
+// (que en el riel Privy es una dirección EVM imposible de probar con SEP-10).
+async function sessionWalletUrl(url: string): Promise<string> {
+  const account = await awaitSeyfAuthAccount();
+  if (!account) return url;
+  const u = new URL(url, window.location.origin);
+  if (u.searchParams.has("wallet")) u.searchParams.set("wallet", account);
+  return u.pathname + u.search;
+}
+
+async function sessionWalletBody(body: unknown): Promise<unknown> {
+  const account = await awaitSeyfAuthAccount();
+  if (!account || typeof body !== "object" || body === null) return body;
+  if (!("wallet" in body)) return body;
+  return { ...(body as Record<string, unknown>), wallet: account };
+}
+
 async function jget<T>(url: string): Promise<T> {
-  const r = await fetch(url);
+  const r = await fetch(await sessionWalletUrl(url), { headers: await seyfAuthHeaders() });
   return (await r.json()) as T;
 }
 async function jpost(url: string, body: unknown) {
-  await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(await seyfAuthHeaders()) },
+    body: JSON.stringify(await sessionWalletBody(body)),
+  });
 }
 async function jdel(url: string) {
-  await fetch(url, { method: "DELETE" });
+  await fetch(await sessionWalletUrl(url), {
+    method: "DELETE",
+    headers: await seyfAuthHeaders(),
+  });
 }
 
 export interface StoreProfile {
