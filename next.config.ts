@@ -16,6 +16,16 @@ const nextConfig: NextConfig = {
       { source: "/api/soroswap/send", destination: "/api/swap/send" },
     ];
   },
+  // SEP-1: el stellar.toml debe servirse con CORS abierto para que wallets y
+  // anclas puedan leerlo desde otro origen.
+  async headers() {
+    return [
+      {
+        source: "/.well-known/stellar.toml",
+        headers: [{ key: "Access-Control-Allow-Origin", value: "*" }],
+      },
+    ];
+  },
 };
 
 export default nextConfig;
