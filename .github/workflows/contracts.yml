@@ -1,0 +1,59 @@
+name: Contracts (Soroban)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'contracts-soroban/**'
+      - '.github/workflows/contracts.yml'
+  pull_request:
+    paths:
+      - 'contracts-soroban/**'
+      - '.github/workflows/contracts.yml'
+
+concurrency:
+  group: contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # La action de stellar-cli verifica la attestation del binario con `gh`.
+  attestations: read
+
+defaults:
+  run:
+    working-directory: contracts-soroban
+
+jobs:
+  seyf-advance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # soroban-sdk 29 pide rustc >= 1.91 y el target wasm32v1-none.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts-soroban
+
+      # Misma versión del CLI que se usó para desplegar en testnet. soroban-sdk 29
+      # rechaza `cargo build` directo a wasm: el build tiene que pasar por el CLI.
+      - uses: stellar/stellar-cli@v28.1.0
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build wasm
+        run: |
+          stellar contract build --locked
+          sha256sum target/wasm32v1-none/release/*.wasm
+          ls -l target/wasm32v1-none/release/*.wasm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seyf_advance-wasm
+          path: contracts-soroban/target/wasm32v1-none/release/*.wasm
+          if-no-files-found: error
