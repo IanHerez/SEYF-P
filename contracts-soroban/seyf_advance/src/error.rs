@@ -8,13 +8,15 @@ pub enum Error {
     NotAllowed = 2,
     PositionExists = 3,
     NoPosition = 4,
-    NotMatured = 5,
+    /// El rendimiento de la posición aún no cubre el adelanto.
+    YieldNotCovered = 5,
     TermOutOfRange = 6,
     ZeroShares = 7,
     ExceedsLtv = 8,
     ExceedsUserCap = 9,
     ExceedsGlobalCap = 10,
-    InsufficientTreasury = 11,
+    /// La cuenta de liquidez no tiene saldo o allowance para el adelanto.
+    InsufficientLiquidity = 11,
     AdvanceBelowMin = 12,
     // Fuera de la lista de la spec, necesarios para validar entradas.
     InvalidParams = 13,

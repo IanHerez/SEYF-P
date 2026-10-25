@@ -8,10 +8,6 @@ publish = false
 crate-type = ["lib", "cdylib"]
 doctest = false
 
-[features]
-# Solo testnet: un día de plazo dura 60 s (ver SECONDS_PER_DAY en lib.rs).
-fast-time = []
-
 [dependencies]
 soroban-sdk = { workspace = true }
 

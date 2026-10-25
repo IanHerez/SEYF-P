@@ -1,10 +1,13 @@
 //! `seyf_advance`: adelanto del rendimiento de un vault USDC de DeFindex.
 //!
-//! El contrato custodia las acciones del vault del usuario y le paga hoy,
-//! desde una tesorería en USDC, el rendimiento que esas acciones generarán en
-//! un plazo. Al vencer retira del vault solo lo necesario para cubrir el
-//! adelanto y devuelve el resto. Todo es USDC sobre USDC: sin oráculo ni
-//! liquidaciones. Spec: sección 5 del plan de HackMeridian.
+//! El contrato funciona como escrow: custodia las acciones del vault del
+//! usuario, que siguen rindiendo, y le adelanta hoy en USDC el rendimiento de
+//! un plazo. El USDC del adelanto sale de una cuenta de liquidez aparte (vía
+//! allowance), nunca del vault. Las acciones quedan bloqueadas hasta que su
+//! rendimiento cubre el adelanto; entonces se retira del vault exactamente ese
+//! rendimiento hacia la liquidez y el usuario recupera su principal completo.
+//! Todo es USDC sobre USDC: sin oráculo ni liquidaciones. Spec: sección 5 del
+//! plan de HackMeridian.
 
 #![no_std]
 
@@ -25,12 +28,7 @@ use crate::vault::VaultClient;
 
 const BPS: i128 = 10_000;
 const DAYS_PER_YEAR: i128 = 365;
-#[cfg(not(feature = "fast-time"))]
 const SECONDS_PER_DAY: u64 = 86_400;
-/// Solo para demos en testnet: un "día" de plazo dura 60 s para poder mostrar
-/// `settle` dentro del hackathon. El adelanto se calcula igual. Nunca en mainnet.
-#[cfg(feature = "fast-time")]
-const SECONDS_PER_DAY: u64 = 60;
 
 #[contract]
 pub struct SeyfAdvance;
@@ -42,12 +40,14 @@ impl SeyfAdvance {
         admin: Address,
         vault: Address,
         asset: Address,
+        liquidity: Address,
         params: Params,
     ) -> Result<(), Error> {
         storage::set_params(&e, &params)?;
         storage::set_admin(&e, &admin);
         e.storage().instance().set(&storage::DataKey::Vault, &vault);
         e.storage().instance().set(&storage::DataKey::Asset, &asset);
+        storage::set_liquidity(&e, &liquidity);
         storage::set_paused(&e, false);
         storage::set_outstanding(&e, 0);
         storage::bump_instance(&e);
@@ -62,7 +62,8 @@ impl SeyfAdvance {
         Self::compute_advance(&e, shares, term_days)
     }
 
-    /// Bloquea `shares` del vault en el contrato y paga el adelanto en USDC.
+    /// Bloquea `shares` del vault en el contrato y paga el adelanto en USDC
+    /// desde la cuenta de liquidez.
     pub fn open_advance(
         e: Env,
         user: Address,
@@ -89,13 +90,14 @@ impl SeyfAdvance {
         }
 
         let asset = TokenClient::new(&e, &storage::asset(&e));
+        let liquidity = storage::liquidity(&e);
         let this = e.current_contract_address();
-        if asset.balance(&this) < advance {
-            return Err(Error::InsufficientTreasury);
+        if Self::available_liquidity(&asset, &liquidity, &this) < advance {
+            return Err(Error::InsufficientLiquidity);
         }
 
         let now = e.ledger().timestamp();
-        let matures_at = (term_days as u64)
+        let expected_unlock_at = (term_days as u64)
             .checked_mul(SECONDS_PER_DAY)
             .and_then(|t| now.checked_add(t))
             .ok_or(Error::MathOverflow)?;
@@ -113,25 +115,25 @@ impl SeyfAdvance {
                 value_at_open: value,
                 advance,
                 opened_at: now,
-                matures_at,
+                expected_unlock_at,
             },
         );
 
         VaultClient::new(&e, &storage::vault(&e)).transfer(&user, &this, &shares);
-        asset.transfer(&this, &user, &advance);
+        asset.transfer_from(&this, &liquidity, &user, &advance);
 
         AdvanceOpened {
             user,
             shares,
             value,
             advance,
-            matures_at,
+            expected_unlock_at,
         }
         .publish(&e);
         Ok(advance)
     }
 
-    /// Devuelve el adelanto en USDC y recupera todas las acciones.
+    /// Devuelve el adelanto en USDC a la liquidez y recupera todas las acciones.
     pub fn repay(e: Env, user: Address) -> Result<(), Error> {
         user.require_auth();
         storage::bump_instance(&e);
@@ -143,7 +145,11 @@ impl SeyfAdvance {
         Self::close_position(&e, &user, position.advance)?;
 
         let this = e.current_contract_address();
-        TokenClient::new(&e, &storage::asset(&e)).transfer(&user, &this, &position.advance);
+        TokenClient::new(&e, &storage::asset(&e)).transfer(
+            &user,
+            &storage::liquidity(&e),
+            &position.advance,
+        );
         VaultClient::new(&e, &storage::vault(&e)).transfer(&this, &user, &position.shares);
 
         AdvanceRepaid {
@@ -154,52 +160,57 @@ impl SeyfAdvance {
         Ok(())
     }
 
-    /// Cierra una posición vencida. Cualquiera puede llamarla, también en pausa.
+    /// Cierra una posición cuyo rendimiento ya cubre el adelanto. Cualquiera
+    /// puede llamarla, también en pausa.
     ///
-    /// Retira del vault las acciones que cubren el adelanto al valor actual y
-    /// devuelve el resto al usuario. Si el vault vale menos que el adelanto,
-    /// retira todo y el faltante queda en el evento.
+    /// Retira del vault las acciones que valen el adelanto (el rendimiento
+    /// generado), lo manda a la liquidez y devuelve el resto al usuario: su
+    /// principal completo más el rendimiento sobrante. Si el rendimiento aún no
+    /// alcanza, las acciones siguen bloqueadas.
     pub fn settle(e: Env, user: Address) -> Result<(), Error> {
         storage::bump_instance(&e);
 
         let position = storage::position(&e, &user).ok_or(Error::NoPosition)?;
-        if e.ledger().timestamp() < position.matures_at {
-            return Err(Error::NotMatured);
-        }
-        Self::close_position(&e, &user, position.advance)?;
-
         let vault = VaultClient::new(&e, &storage::vault(&e));
         let shares = position.shares;
         let advance = position.advance;
         let value_now = Self::vault_value(&vault, shares)?;
 
-        // s_redeem = min(s, ceil(A * s / V_now)), a favor del protocolo.
-        let shares_redeemed = if value_now <= advance {
-            shares
-        } else {
-            mul_div_ceil(advance, shares, value_now)?.min(shares)
-        };
-        // En un retiro parcial se exige al menos A; en uno total no hay nada
-        // que proteger porque todas las acciones salen.
-        let min_out = if shares_redeemed < shares { advance } else { 0 };
+        // Desbloqueo por rendimiento: V_now >= V_open + A.
+        let unlock_value = position
+            .value_at_open
+            .checked_add(advance)
+            .ok_or(Error::MathOverflow)?;
+        if value_now < unlock_value {
+            return Err(Error::YieldNotCovered);
+        }
+        Self::close_position(&e, &user, advance)?;
+
+        // s_redeem = ceil(A * s / V_now), a favor de la liquidez. Como
+        // V_now >= V_open + A > A, siempre es un retiro parcial.
+        let shares_redeemed = mul_div_ceil(advance, shares, value_now)?.min(shares);
 
         let this = e.current_contract_address();
         let received = vault
-            .withdraw(&shares_redeemed, &vec![&e, min_out], &this)
+            .withdraw(&shares_redeemed, &vec![&e, advance], &this)
             .get(0)
             .ok_or(Error::InvalidVaultValue)?;
+        TokenClient::new(&e, &storage::asset(&e)).transfer(
+            &this,
+            &storage::liquidity(&e),
+            &received,
+        );
 
         let shares_returned = shares - shares_redeemed;
         if shares_returned > 0 {
             vault.transfer(&this, &user, &shares_returned);
         }
-        let shortfall = if received < advance { advance - received } else { 0 };
 
         AdvanceSettled {
             user,
             shares_redeemed,
             shares_returned,
-            shortfall,
+            recovered: received,
         }
         .publish(&e);
         Ok(())
@@ -207,20 +218,11 @@ impl SeyfAdvance {
 
     // ------------------------------------------------------------------ admin
 
-    /// Retira USDC libre de la tesorería hacia el admin.
-    pub fn withdraw_treasury(e: Env, amount: i128) -> Result<(), Error> {
-        let admin = Self::require_admin(&e);
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        let asset = TokenClient::new(&e, &storage::asset(&e));
-        let this = e.current_contract_address();
-        if asset.balance(&this) < amount {
-            return Err(Error::InsufficientTreasury);
-        }
-        asset.transfer(&this, &admin, &amount);
-        TreasuryWithdrawn { to: admin, amount }.publish(&e);
-        Ok(())
+    /// Cambia la cuenta de liquidez de la que salen los adelantos.
+    pub fn set_liquidity(e: Env, liquidity: Address) {
+        Self::require_admin(&e);
+        storage::set_liquidity(&e, &liquidity);
+        LiquiditySet { liquidity }.publish(&e);
     }
 
     pub fn set_params(e: Env, params: Params) -> Result<(), Error> {
@@ -281,13 +283,26 @@ impl SeyfAdvance {
         storage::position(&e, &user)
     }
 
+    /// Valor actual de la posición y el valor que debe alcanzar para liberarse.
+    pub fn unlock_status(e: Env, user: Address) -> Result<(i128, i128), Error> {
+        let position = storage::position(&e, &user).ok_or(Error::NoPosition)?;
+        let vault = VaultClient::new(&e, &storage::vault(&e));
+        let value_now = Self::vault_value(&vault, position.shares)?;
+        let unlock_value = position
+            .value_at_open
+            .checked_add(position.advance)
+            .ok_or(Error::MathOverflow)?;
+        Ok((value_now, unlock_value))
+    }
+
     pub fn outstanding(e: Env) -> i128 {
         storage::outstanding(&e)
     }
 
-    /// Saldo USDC del contrato disponible para pagar adelantos.
+    /// USDC que la cuenta de liquidez puede aportar hoy: min(saldo, allowance).
     pub fn treasury(e: Env) -> i128 {
-        TokenClient::new(&e, &storage::asset(&e)).balance(&e.current_contract_address())
+        let asset = TokenClient::new(&e, &storage::asset(&e));
+        Self::available_liquidity(&asset, &storage::liquidity(&e), &e.current_contract_address())
     }
 
     pub fn params(e: Env) -> Params {
@@ -313,6 +328,10 @@ impl SeyfAdvance {
     pub fn asset(e: Env) -> Address {
         storage::asset(&e)
     }
+
+    pub fn liquidity(e: Env) -> Address {
+        storage::liquidity(&e)
+    }
 }
 
 impl SeyfAdvance {
@@ -321,6 +340,12 @@ impl SeyfAdvance {
         admin.require_auth();
         storage::bump_instance(e);
         admin
+    }
+
+    fn available_liquidity(asset: &TokenClient, liquidity: &Address, spender: &Address) -> i128 {
+        asset
+            .balance(liquidity)
+            .min(asset.allowance(liquidity, spender))
     }
 
     /// Borra la posición y descuenta su adelanto de `Outstanding`.

@@ -106,11 +106,12 @@ impl MockVault {
 // ------------------------------------------------------------------- entorno
 
 const USDC: i128 = 10_000_000; // 7 decimales
-const DAY: u64 = 86_400;
+const LIQUIDITY: i128 = 50 * USDC;
 
 struct Setup<'a> {
     e: Env,
     admin: Address,
+    liquidity: Address,
     usdc: TokenClient<'a>,
     usdc_admin: StellarAssetClient<'a>,
     vault: MockVaultClient<'a>,
@@ -137,6 +138,7 @@ impl<'a> Setup<'a> {
         e.ledger().set_timestamp(1_000_000);
 
         let admin = Address::generate(&e);
+        let liquidity = Address::generate(&e);
         let sac = e.register_stellar_asset_contract_v2(Address::generate(&e));
         let usdc = TokenClient::new(&e, &sac.address());
         let usdc_admin = StellarAssetClient::new(&e, &sac.address());
@@ -146,14 +148,27 @@ impl<'a> Setup<'a> {
 
         let advance_id = e.register(
             SeyfAdvance,
-            (admin.clone(), vault_id.clone(), sac.address(), default_params()),
+            (
+                admin.clone(),
+                vault_id.clone(),
+                sac.address(),
+                liquidity.clone(),
+                default_params(),
+            ),
         );
         let advance = SeyfAdvanceClient::new(&e, &advance_id);
 
-        // Tesorería de 50 USDC.
-        usdc_admin.mint(&advance_id, &(50 * USDC));
+        // Cuenta de liquidez con 50 USDC y allowance completo para el contrato.
+        usdc_admin.mint(&liquidity, &LIQUIDITY);
+        let s = Setup { e, admin, liquidity, usdc, usdc_admin, vault, advance, users: std::vec::Vec::new() };
+        s.approve_liquidity(LIQUIDITY);
+        s
+    }
 
-        Setup { e, admin, usdc, usdc_admin, vault, advance, users: std::vec::Vec::new() }
+    fn approve_liquidity(&self, amount: i128) {
+        let expiration = self.e.ledger().sequence() + 10_000;
+        self.usdc
+            .approve(&self.liquidity, &self.advance.address, &amount, &expiration);
     }
 
     /// Usuario aprobado con `deposit` USDC depositados en el vault.
@@ -171,9 +186,8 @@ impl<'a> Setup<'a> {
         self.usdc_admin.mint(&self.vault.address, &amount);
     }
 
-    fn warp_days(&self, days: u64) {
-        let now = self.e.ledger().timestamp();
-        self.e.ledger().set_timestamp(now + days * DAY);
+    fn value_of(&self, shares: i128) -> i128 {
+        self.vault.get_asset_amounts_per_shares(&shares).get(0).unwrap()
     }
 
     /// Invariantes 1 y 2 de la sección 5.6.
@@ -192,6 +206,8 @@ impl<'a> Setup<'a> {
             shares,
             "acciones del contrato != suma de acciones de las posiciones"
         );
+        // El contrato nunca retiene USDC: todo pasa a la liquidez o al usuario.
+        assert_eq!(self.usdc.balance(&self.advance.address), 0);
     }
 }
 
@@ -203,7 +219,7 @@ fn expected_advance(value: i128, apy_bps: u32, days: u32) -> i128 {
 // --------------------------------------------------------------------- tests
 
 #[test]
-fn open_advance_pays_exact_amount_and_locks_shares() {
+fn open_advance_pays_from_liquidity_and_locks_shares() {
     let mut s = Setup::new();
     let (user, shares) = s.user(100 * USDC);
 
@@ -214,15 +230,17 @@ fn open_advance_pays_exact_amount_and_locks_shares() {
     let paid = s.advance.open_advance(&user, &shares, &90, &expected);
     assert_eq!(paid, expected);
     assert_eq!(s.usdc.balance(&user), expected);
+    assert_eq!(s.usdc.balance(&s.liquidity), LIQUIDITY - expected);
+    assert_eq!(s.advance.treasury(), LIQUIDITY - expected);
     assert_eq!(s.vault.balance(&user), 0);
     assert_eq!(s.vault.balance(&s.advance.address), shares);
-    assert_eq!(s.advance.treasury(), 50 * USDC - expected);
 
     let p = s.advance.position(&user).unwrap();
     assert_eq!(p.shares, shares);
     assert_eq!(p.value_at_open, 100 * USDC);
     assert_eq!(p.advance, expected);
-    assert_eq!(p.matures_at, p.opened_at + 90 * DAY);
+    assert_eq!(p.expected_unlock_at, p.opened_at + 90 * 86_400);
+    assert_eq!(s.advance.unlock_status(&user), (100 * USDC, 100 * USDC + expected));
     s.check_invariants();
 }
 
@@ -234,7 +252,8 @@ fn open_advance_authorizes_user_and_share_transfer() {
     s.advance.open_advance(&user, &shares, &90, &1);
 
     // El usuario firma la llamada raíz y, dentro del mismo árbol, la
-    // transferencia de sus acciones al contrato.
+    // transferencia de sus acciones al contrato. El `transfer_from` de la
+    // liquidez lo autoriza el propio contrato (gasta su allowance).
     assert_eq!(
         s.e.auths(),
         std::vec![(
@@ -263,7 +282,6 @@ fn open_advance_rejections() {
     let mut s = Setup::new();
     let (user, shares) = s.user(100 * USDC);
 
-    // Plazo fuera de rango y acciones en cero.
     assert_eq!(s.advance.try_open_advance(&user, &shares, &29, &0), Err(Ok(Error::TermOutOfRange)));
     assert_eq!(s.advance.try_open_advance(&user, &shares, &366, &0), Err(Ok(Error::TermOutOfRange)));
     assert_eq!(s.advance.try_open_advance(&user, &0, &90, &0), Err(Ok(Error::ZeroShares)));
@@ -271,24 +289,20 @@ fn open_advance_rejections() {
     // Tope de LTV: 8% anual a 365 días = 8% > 5%.
     assert_eq!(s.advance.try_open_advance(&user, &shares, &365, &0), Err(Ok(Error::ExceedsLtv)));
 
-    // Mínimo exigido por el usuario.
     let expected = expected_advance(100 * USDC, 800, 90);
     assert_eq!(
         s.advance.try_open_advance(&user, &shares, &90, &(expected + 1)),
         Err(Ok(Error::AdvanceBelowMin))
     );
 
-    // Pausa.
     s.advance.pause();
     assert_eq!(s.advance.try_open_advance(&user, &shares, &90, &0), Err(Ok(Error::Paused)));
     s.advance.unpause();
 
-    // Fuera de la lista.
     s.advance.set_allowed(&user, &false);
     assert_eq!(s.advance.try_open_advance(&user, &shares, &90, &0), Err(Ok(Error::NotAllowed)));
     s.advance.set_allowed(&user, &true);
 
-    // Posición existente.
     s.advance.open_advance(&user, &(shares / 2), &90, &0);
     assert_eq!(
         s.advance.try_open_advance(&user, &(shares / 2), &90, &0),
@@ -308,7 +322,6 @@ fn open_advance_caps() {
         Err(Ok(Error::ExceedsUserCap))
     );
 
-    // Tope global: bajarlo a 3 USDC; el segundo adelanto lo rebasa.
     let mut p = default_params();
     p.global_cap = 3 * USDC;
     p.per_user_cap = 3 * USDC;
@@ -324,29 +337,40 @@ fn open_advance_caps() {
 }
 
 #[test]
-fn open_advance_requires_treasury() {
+fn open_advance_requires_liquidity_balance_and_allowance() {
     let mut s = Setup::new();
     let (user, shares) = s.user(100 * USDC);
-    s.advance.withdraw_treasury(&(50 * USDC - 1));
+
+    // Sin allowance suficiente.
+    s.approve_liquidity(1);
+    assert_eq!(s.advance.treasury(), 1);
     assert_eq!(
         s.advance.try_open_advance(&user, &shares, &90, &0),
-        Err(Ok(Error::InsufficientTreasury))
+        Err(Ok(Error::InsufficientLiquidity))
+    );
+
+    // Con allowance pero sin saldo.
+    s.approve_liquidity(LIQUIDITY);
+    let sink = Address::generate(&s.e);
+    s.usdc.transfer(&s.liquidity, &sink, &(LIQUIDITY - 1));
+    assert_eq!(
+        s.advance.try_open_advance(&user, &shares, &90, &0),
+        Err(Ok(Error::InsufficientLiquidity))
     );
 }
 
 #[test]
-fn repay_returns_all_shares() {
+fn repay_returns_all_shares_and_refills_liquidity() {
     let mut s = Setup::new();
     let (user, shares) = s.user(100 * USDC);
-    let advance = s.advance.open_advance(&user, &shares, &90, &0);
+    s.advance.open_advance(&user, &shares, &90, &0);
 
     s.advance.repay(&user);
     assert_eq!(s.vault.balance(&user), shares);
     assert_eq!(s.usdc.balance(&user), 0);
-    assert_eq!(s.advance.treasury(), 50 * USDC);
+    assert_eq!(s.usdc.balance(&s.liquidity), LIQUIDITY);
     assert_eq!(s.advance.outstanding(), 0);
     assert_eq!(s.advance.position(&user), None);
-    assert!(advance > 0);
     s.check_invariants();
 
     // No se puede cerrar dos veces.
@@ -364,36 +388,32 @@ fn repay_blocked_while_paused() {
 }
 
 #[test]
-fn settle_before_maturity_fails() {
-    let mut s = Setup::new();
-    let (user, shares) = s.user(100 * USDC);
-    s.advance.open_advance(&user, &shares, &90, &0);
-    s.warp_days(89);
-    assert_eq!(s.advance.try_settle(&user), Err(Ok(Error::NotMatured)));
-}
-
-#[test]
-fn settle_redeems_only_what_covers_the_advance() {
+fn settle_waits_until_yield_covers_the_advance() {
     let mut s = Setup::new();
     let (user, shares) = s.user(100 * USDC);
     let advance = s.advance.open_advance(&user, &shares, &90, &0);
 
-    // El vault rinde 10%: V_now = 110 USDC.
-    s.accrue(10 * USDC);
-    s.warp_days(90);
-    let treasury_before = s.advance.treasury();
+    // El tiempo solo no libera nada: hace falta rendimiento.
+    s.e.ledger().set_timestamp(1_000_000 + 400 * 86_400);
+    assert_eq!(s.advance.try_settle(&user), Err(Ok(Error::YieldNotCovered)));
 
-    // Cualquiera puede liquidar, también en pausa.
+    // Falta 1 unidad para cubrir el adelanto.
+    s.accrue(advance - 1);
+    assert_eq!(s.advance.try_settle(&user), Err(Ok(Error::YieldNotCovered)));
+
+    // Ya lo cubre: cualquiera liquida, también en pausa, sin firmas.
+    s.accrue(1);
     s.advance.pause();
+    let liquidity_before = s.usdc.balance(&s.liquidity);
     s.advance.settle(&user);
+    assert_eq!(s.e.auths(), std::vec![]);
 
-    let value_now = 110 * USDC;
-    let redeemed = (advance * shares + value_now - 1) / value_now; // ceil
-    assert_eq!(redeemed, 17_932_752);
-    assert_eq!(s.vault.balance(&user), shares - redeemed);
-    assert_eq!(s.vault.balance(&s.advance.address), 0);
-    // La tesorería recupera al menos el adelanto.
-    assert!(s.advance.treasury() - treasury_before >= advance);
+    // La liquidez recupera al menos el adelanto.
+    assert!(s.usdc.balance(&s.liquidity) - liquidity_before >= advance);
+    // El usuario recupera su principal completo (salvo el redondeo de una acción).
+    let returned = s.vault.balance(&user);
+    assert!(returned < shares);
+    assert!(s.value_of(returned) >= 100 * USDC - 1);
     assert_eq!(s.advance.outstanding(), 0);
     assert_eq!(s.advance.position(&user), None);
     s.check_invariants();
@@ -402,24 +422,36 @@ fn settle_redeems_only_what_covers_the_advance() {
 }
 
 #[test]
-fn settle_with_loss_redeems_everything() {
+fn settle_returns_extra_yield_to_user() {
     let mut s = Setup::new();
     let (user, shares) = s.user(100 * USDC);
     let advance = s.advance.open_advance(&user, &shares, &90, &0);
 
-    // Pérdida en la estrategia: el vault queda con menos que el adelanto.
-    let sink = Address::generate(&s.e);
-    s.vault.drain(&sink, &(100 * USDC - advance / 2));
-    s.warp_days(90);
-    let treasury_before = s.advance.treasury();
-
+    // El vault rinde 10 USDC, más que el adelanto (~1.97 USDC).
+    s.accrue(10 * USDC);
     s.advance.settle(&user);
 
-    assert_eq!(s.vault.balance(&user), 0);
-    assert_eq!(s.vault.balance(&s.advance.address), 0);
-    let recovered = s.advance.treasury() - treasury_before;
-    assert_eq!(recovered, advance / 2);
-    assert_eq!(s.advance.outstanding(), 0);
+    let returned_value = s.value_of(s.vault.balance(&user));
+    // Principal + rendimiento - adelanto, salvo redondeo.
+    assert!(returned_value >= 110 * USDC - advance - 2);
+    assert!(returned_value <= 110 * USDC - advance);
+    s.check_invariants();
+}
+
+#[test]
+fn vault_loss_keeps_shares_locked_until_repay() {
+    let mut s = Setup::new();
+    let (user, shares) = s.user(100 * USDC);
+    s.advance.open_advance(&user, &shares, &90, &0);
+
+    // Pérdida en la estrategia: no se puede liquidar contra el principal.
+    let sink = Address::generate(&s.e);
+    s.vault.drain(&sink, &(5 * USDC));
+    assert_eq!(s.advance.try_settle(&user), Err(Ok(Error::YieldNotCovered)));
+
+    // El usuario puede salir repagando y recupera todas sus acciones.
+    s.advance.repay(&user);
+    assert_eq!(s.vault.balance(&user), shares);
     s.check_invariants();
 }
 
@@ -428,14 +460,28 @@ fn admin_only_functions() {
     let s = Setup::new();
     let e = &s.e;
 
-    // Sin firmas simuladas, todo lo de admin falla.
     e.set_auths(&[]);
     assert!(s.advance.try_pause().is_err());
     assert!(s.advance.try_unpause().is_err());
     assert!(s.advance.try_set_params(&default_params()).is_err());
-    assert!(s.advance.try_withdraw_treasury(&1).is_err());
+    assert!(s.advance.try_set_liquidity(&Address::generate(e)).is_err());
     assert!(s.advance.try_set_allowed(&Address::generate(e), &true).is_err());
     assert!(s.advance.try_propose_admin(&Address::generate(e)).is_err());
+}
+
+#[test]
+fn set_liquidity_switches_the_source() {
+    let mut s = Setup::new();
+    let (user, shares) = s.user(100 * USDC);
+
+    let new_liquidity = Address::generate(&s.e);
+    s.advance.set_liquidity(&new_liquidity);
+    assert_eq!(s.advance.liquidity(), new_liquidity);
+    assert_eq!(s.advance.treasury(), 0);
+    assert_eq!(
+        s.advance.try_open_advance(&user, &shares, &90, &0),
+        Err(Ok(Error::InsufficientLiquidity))
+    );
 }
 
 #[test]
@@ -468,17 +514,4 @@ fn two_step_admin_change() {
     assert_eq!(auths.len(), 1);
     assert_eq!(auths[0].0, new_admin);
     assert_eq!(s.advance.admin(), new_admin);
-}
-
-#[test]
-fn withdraw_treasury_limits() {
-    let s = Setup::new();
-    assert_eq!(s.advance.try_withdraw_treasury(&0), Err(Ok(Error::InvalidAmount)));
-    assert_eq!(
-        s.advance.try_withdraw_treasury(&(50 * USDC + 1)),
-        Err(Ok(Error::InsufficientTreasury))
-    );
-    s.advance.withdraw_treasury(&(10 * USDC));
-    assert_eq!(s.usdc.balance(&s.admin), 10 * USDC);
-    assert_eq!(s.advance.treasury(), 40 * USDC);
 }

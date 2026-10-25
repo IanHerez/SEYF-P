@@ -10,7 +10,7 @@ pub struct AdvanceOpened {
     pub shares: i128,
     pub value: i128,
     pub advance: i128,
-    pub matures_at: u64,
+    pub expected_unlock_at: u64,
 }
 
 #[contractevent(topics = ["advance_repaid"])]
@@ -28,7 +28,8 @@ pub struct AdvanceSettled {
     pub user: Address,
     pub shares_redeemed: i128,
     pub shares_returned: i128,
-    pub shortfall: i128,
+    /// USDC retirado del vault y enviado a la liquidez (>= adelanto).
+    pub recovered: i128,
 }
 
 #[contractevent(topics = ["params_updated"])]
@@ -57,11 +58,10 @@ pub struct AllowedSet {
     pub allowed: bool,
 }
 
-#[contractevent(topics = ["treasury_withdrawn"])]
+#[contractevent(topics = ["liquidity_set"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TreasuryWithdrawn {
-    pub to: Address,
-    pub amount: i128,
+pub struct LiquiditySet {
+    pub liquidity: Address,
 }
 
 #[contractevent(topics = ["admin_proposed"])]

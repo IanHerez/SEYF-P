@@ -35,7 +35,9 @@ pub struct Position {
     pub value_at_open: i128,
     pub advance: i128,
     pub opened_at: u64,
-    pub matures_at: u64,
+    /// Fecha estimada en que el rendimiento cubre el adelanto (al APY de
+    /// `params`). Solo informativa: el desbloqueo depende del valor real.
+    pub expected_unlock_at: u64,
 }
 
 #[contracttype]
@@ -46,6 +48,7 @@ pub enum DataKey {
     PendingAdmin,
     Vault,
     Asset,
+    Liquidity,
     Params,
     Paused,
     Outstanding,
@@ -92,6 +95,16 @@ pub fn vault(e: &Env) -> Address {
 
 pub fn asset(e: &Env) -> Address {
     e.storage().instance().get(&DataKey::Asset).unwrap()
+}
+
+/// Cuenta o contrato de la que salen los adelantos (vía allowance) y a la que
+/// vuelven los repagos y lo recuperado del vault.
+pub fn liquidity(e: &Env) -> Address {
+    e.storage().instance().get(&DataKey::Liquidity).unwrap()
+}
+
+pub fn set_liquidity(e: &Env, liquidity: &Address) {
+    e.storage().instance().set(&DataKey::Liquidity, liquidity);
 }
 
 pub fn params(e: &Env) -> Params {
